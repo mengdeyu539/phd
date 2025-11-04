@@ -169,10 +169,11 @@ class StyleTransferDataset(Dataset):
 # ===================== 判别器 =====================
 
 class StyleDiscriminator(nn.Module):
-    def __init__(self, hidden_dim=512, style_dim=256, dropout=0.3):
+    def __init__(self, vocab_size, hidden_dim=512, style_dim=256, dropout=0.3):
         super().__init__()
 
-        self.embedding = nn.Embedding(32100, 256)
+        # 🔧 修复：使用动态 vocab_size 而非硬编码
+        self.embedding = nn.Embedding(vocab_size, 256)
         self.lstm = nn.LSTM(256, hidden_dim, num_layers=2,
                             batch_first=True, bidirectional=True, dropout=dropout)
 
@@ -226,20 +227,20 @@ class T5StyleGenerator(nn.Module):
             min_len = 20
             max_len = max_length
 
+        # 🔧 修复：移除 beam search，使用 nucleus sampling 避免参数冲突
+        # num_beams 和 do_sample=True 不应同时使用
         outputs = self.t5.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_length=max_len,
             min_length=min_len,
-            num_beams=5,
             no_repeat_ngram_size=3,
-            early_stopping=True,
             temperature=0.9,
             top_k=50,
             top_p=0.95,
             do_sample=True,
             repetition_penalty=1.2,
-            length_penalty=1.2
+            length_penalty=1.0  # 降低 length_penalty，因为没有 beam search
         )
         return outputs
 
@@ -401,9 +402,8 @@ class ImprovedAdversarialTrainer:
         self.device = rank
         self.dev_data = dev_data
 
-        # 评估工具（只在主进程创建）
-        if self.is_main:
-            self.evaluator = EvaluationMetrics(device=rank)
+        # 🔧 修复：所有进程都创建 evaluator，确保语义损失计算正确
+        self.evaluator = EvaluationMetrics(device=rank)
 
         # ⭐ 初始化WandB（只在主进程）
         if config.get('use_wandb', True) and self.is_main:
@@ -472,9 +472,7 @@ class ImprovedAdversarialTrainer:
         return length_loss
 
     def compute_semantic_loss(self, original_texts, generated_texts):
-        if not self.is_main:
-            return torch.tensor(0.0, device=self.device)
-
+        # 🔧 修复：所有进程都计算语义损失，确保梯度一致性
         similarities = self.evaluator.compute_semantic_similarity(
             original_texts,
             generated_texts
@@ -1042,7 +1040,10 @@ def train_worker(rank, world_size, config, datasets):
         device=rank
     )
 
+    # 🔧 修复：从 tokenizer 获取词汇表大小
+    vocab_size = len(generator.tokenizer)
     discriminator = StyleDiscriminator(
+        vocab_size=vocab_size,
         hidden_dim=512,
         style_dim=256
     )
