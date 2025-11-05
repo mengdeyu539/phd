@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 
 # ===================== 多卡训练工具函数 =====================
 
-def setup_distributed(rank, world_size):
-    """初始化分布式训练环境"""
+def setup_distributed(rank: int, world_size: int) -> None:
+    """🚀 初始化分布式训练环境"""
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
 
@@ -56,19 +56,20 @@ def setup_distributed(rank, world_size):
         logger.info(f"✅ 分布式环境初始化完成 (超时时间: 1800秒)")
 
 
-def cleanup_distributed():
-    """清理分布式训练环境"""
+def cleanup_distributed() -> None:
+    """🚀 清理分布式训练环境"""
     dist.destroy_process_group()
 
 
-def is_main_process(rank):
-    """判断是否为主进程"""
+def is_main_process(rank: int) -> bool:
+    """🚀 判断是否为主进程"""
     return rank == 0
 
 
 # ===================== 数据加载 =====================
 
-def load_text_data(file_path):
+def load_text_data(file_path: str) -> List[str]:
+    """🚀 加载文本数据"""
     texts = []
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -78,7 +79,7 @@ def load_text_data(file_path):
     return texts
 
 
-def load_style_datasets(data_dir):
+def load_style_datasets(data_dir: str) -> Dict[str, Dict]:
     datasets = {}
 
     train_human = load_text_data(os.path.join(data_dir, 'train.human'))
@@ -219,12 +220,24 @@ class T5StyleGenerator(nn.Module):
         )
         return outputs
 
-    def generate_text(self, input_ids, attention_mask, target_length=None, max_length=384):
+    def generate_text(self, input_ids, attention_mask, target_length=None, max_length=384,
+                      min_length_ratio=0.8, max_length_ratio=1.2, min_abs_length=10,
+                      default_min_length=20, temperature=0.9, top_k=50, top_p=0.95,
+                      repetition_penalty=1.2, no_repeat_ngram_size=3):
+        """
+        🚀 生成文本（配置化参数）
+
+        Args:
+            min_length_ratio: 最小长度比例（默认0.8）
+            max_length_ratio: 最大长度比例（默认1.2）
+            min_abs_length: 最小绝对长度（默认10）
+            default_min_length: 无目标长度时的默认最小长度（默认20）
+        """
         if target_length is not None:
-            min_len = max(10, int(target_length * 0.8))
-            max_len = min(max_length, int(target_length * 1.2))
+            min_len = max(min_abs_length, int(target_length * min_length_ratio))
+            max_len = min(max_length, int(target_length * max_length_ratio))
         else:
-            min_len = 20
+            min_len = default_min_length
             max_len = max_length
 
         # 🔧 修复：移除 beam search，使用 nucleus sampling 避免参数冲突
@@ -234,12 +247,12 @@ class T5StyleGenerator(nn.Module):
             attention_mask=attention_mask,
             max_length=max_len,
             min_length=min_len,
-            no_repeat_ngram_size=3,
-            temperature=0.9,
-            top_k=50,
-            top_p=0.95,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
             do_sample=True,
-            repetition_penalty=1.2,
+            repetition_penalty=repetition_penalty,
             length_penalty=1.0  # 降低 length_penalty，因为没有 beam search
         )
         return outputs
@@ -434,18 +447,36 @@ class ImprovedAdversarialTrainer:
             betas=(0.5, 0.999)
         )
 
-        # 学习率调度器
+        # 🚀 学习率调度器（带预热）
+        self.warmup_steps = config.get('warmup_steps', 500)
+        self.total_steps = len(train_loader) * config['num_epochs']
+        self.current_step = 0
+
+        # 使用CosineAnnealingLR with warmup
         self.g_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.g_optimizer, T_max=len(train_loader) * config['num_epochs']
+            self.g_optimizer, T_max=self.total_steps - self.warmup_steps
         )
         self.d_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.d_optimizer, T_max=len(train_loader) * config['num_epochs']
+            self.d_optimizer, T_max=self.total_steps - self.warmup_steps
         )
+
+        if self.is_main and self.warmup_steps > 0:
+            logger.info(f"✅ 学习率预热: {self.warmup_steps} steps")
 
         # ⭐ 获取tokenizer
         self.tokenizer = self.generator_model.tokenizer
 
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
+
+        # 🚀 梯度累积支持
+        self.gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+        self.accumulation_counter = 0
+
+        # 🚀 混合精度训练支持
+        self.use_amp = config.get('use_amp', False)
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        if self.use_amp and self.is_main:
+            logger.info("✅ 启用混合精度训练 (AMP)")
 
         # ⭐ 追踪最佳指标 - 重点关注AI→Human
         self.best_metrics = {
@@ -528,7 +559,14 @@ class ImprovedAdversarialTrainer:
         d_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), 1.0)
         self.d_optimizer.step()
-        self.d_scheduler.step()
+
+        # 🚀 判别器学习率预热
+        if self.current_step <= self.warmup_steps:
+            warmup_factor = self.current_step / self.warmup_steps
+            for param_group in self.d_optimizer.param_groups:
+                param_group['lr'] = self.config['d_learning_rate'] * warmup_factor
+        else:
+            self.d_scheduler.step()
 
         with torch.no_grad():
             real_human_acc = (real_human_logits.argmax(1) == real_human_labels).float().mean()
@@ -538,7 +576,10 @@ class ImprovedAdversarialTrainer:
 
     def train_generator(self, batch):
         self.generator.train()
-        self.g_optimizer.zero_grad()
+
+        # 🚀 梯度累积：只在累积周期开始时清零梯度
+        if self.accumulation_counter == 0:
+            self.g_optimizer.zero_grad()
 
         input_ids = batch['input_ids'].to(self.device)
         attention_mask = batch['attention_mask'].to(self.device)
@@ -547,50 +588,81 @@ class ImprovedAdversarialTrainer:
         original_lengths = batch['original_length'].to(self.device)
         texts = batch['text']
 
-        # ⭐ Teacher forcing
-        outputs = self.generator_model.forward_with_teacher_forcing(
-            input_ids, attention_mask, target_ids
-        )
-        reconstruction_loss = outputs.loss
+        # 🚀 使用混合精度训练
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            # ⭐ Teacher forcing
+            outputs = self.generator_model.forward_with_teacher_forcing(
+                input_ids, attention_mask, target_ids
+            )
+            reconstruction_loss = outputs.loss
 
-        # 🔧 优化：批量生成文本（使用平均长度作为目标）
-        with torch.no_grad():
-            avg_target_len = int(original_lengths.float().mean().item())
+            # 🔧 优化：批量生成文本（使用平均长度作为目标）
+            with torch.no_grad():
+                avg_target_len = int(original_lengths.float().mean().item())
 
-            # 批量生成
-            generated_ids = self.generator_model.generate_text(
-                input_ids, attention_mask, target_length=avg_target_len
+                # 批量生成
+                generated_ids = self.generator_model.generate_text(
+                    input_ids, attention_mask, target_length=avg_target_len
+                )
+
+            generated_texts = [
+                self.tokenizer.decode(ids, skip_special_tokens=True)
+                for ids in generated_ids
+            ]
+
+            # 损失计算
+            length_loss = self.compute_length_loss(generated_ids, original_lengths)
+            semantic_loss = self.compute_semantic_loss(list(texts), generated_texts)
+
+            gen_inputs = self.tokenizer(
+                generated_texts, padding=True, truncation=True,
+                max_length=384, return_tensors='pt'
+            ).to(self.device)
+
+            fake_logits = self.discriminator(gen_inputs['input_ids'])
+            adv_loss = self.ce_loss(fake_logits, target_style)
+
+            # 总损失
+            g_loss = (
+                    self.config['lambda_reconstruction'] * reconstruction_loss +
+                    self.config['lambda_adv'] * adv_loss +
+                    self.config['lambda_length'] * length_loss +
+                    self.config['lambda_semantic'] * semantic_loss
             )
 
-        generated_texts = [
-            self.tokenizer.decode(ids, skip_special_tokens=True)
-            for ids in generated_ids
-        ]
+            # 🚀 梯度累积：缩放损失
+            scaled_loss = g_loss / self.gradient_accumulation_steps
 
-        # 损失计算
-        length_loss = self.compute_length_loss(generated_ids, original_lengths)
-        semantic_loss = self.compute_semantic_loss(list(texts), generated_texts)
+        # 🚀 混合精度：使用scaler进行反向传播
+        if self.use_amp:
+            self.scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
 
-        gen_inputs = self.tokenizer(
-            generated_texts, padding=True, truncation=True,
-            max_length=384, return_tensors='pt'
-        ).to(self.device)
+        # 🚀 梯度累积：只在累积周期结束时更新权重
+        self.accumulation_counter += 1
+        if self.accumulation_counter >= self.gradient_accumulation_steps:
+            if self.use_amp:
+                self.scaler.unscale_(self.g_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 1.0)
+                self.scaler.step(self.g_optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 1.0)
+                self.g_optimizer.step()
 
-        fake_logits = self.discriminator(gen_inputs['input_ids'])
-        adv_loss = self.ce_loss(fake_logits, target_style)
+            # 🚀 学习率预热逻辑
+            self.current_step += 1
+            if self.current_step <= self.warmup_steps:
+                # Warmup阶段：线性增加学习率
+                warmup_factor = self.current_step / self.warmup_steps
+                for param_group in self.g_optimizer.param_groups:
+                    param_group['lr'] = self.config['g_learning_rate'] * warmup_factor
+            else:
+                # Warmup后：使用cosine调度
+                self.g_scheduler.step()
 
-        # 总损失
-        g_loss = (
-                self.config['lambda_reconstruction'] * reconstruction_loss +
-                self.config['lambda_adv'] * adv_loss +
-                self.config['lambda_length'] * length_loss +
-                self.config['lambda_semantic'] * semantic_loss
-        )
-
-        g_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 1.0)
-        self.g_optimizer.step()
-        self.g_scheduler.step()
+            self.accumulation_counter = 0
 
         return {
             'g_loss': g_loss.item(),
@@ -636,7 +708,7 @@ class ImprovedAdversarialTrainer:
             self.generator.eval()
             with torch.no_grad():
                 # 🔧 修复：平衡样本数量，避免判别器偏向某一类
-                max_samples = 10  # 统一使用10个样本
+                max_samples = self.config['max_samples_per_direction']
 
                 fake_human_texts = []
                 for text in ai_texts[:min(len(ai_texts), max_samples)]:
@@ -954,19 +1026,25 @@ class ImprovedAdversarialTrainer:
                 logger.info(f"{'=' * 80}\n")
 
             # ⭐ 判断是否为最佳模型
+            # 🚀 评估权重（可配置）
+            EVAL_WEIGHT_AI2H_SEMANTIC = self.config.get('eval_weight_ai2h_semantic', 0.3)
+            EVAL_WEIGHT_AI2H_BLEU = self.config.get('eval_weight_ai2h_bleu', 0.2)
+            EVAL_WEIGHT_AI2H_SUCCESS = self.config.get('eval_weight_ai2h_success', 0.4)
+            EVAL_WEIGHT_H2A_SUCCESS = self.config.get('eval_weight_h2a_success', 0.1)
+
             is_best = False
             current_score = (
-                    eval_metrics.get('ai_to_human_semantic_sim', 0) * 0.3 +
-                    eval_metrics.get('ai_to_human_bleu', 0) * 0.2 +
-                    eval_metrics.get('ai_to_human_success_rate', 0) * 0.4 +
-                    eval_metrics.get('human_to_ai_success_rate', 0) * 0.1
+                    eval_metrics.get('ai_to_human_semantic_sim', 0) * EVAL_WEIGHT_AI2H_SEMANTIC +
+                    eval_metrics.get('ai_to_human_bleu', 0) * EVAL_WEIGHT_AI2H_BLEU +
+                    eval_metrics.get('ai_to_human_success_rate', 0) * EVAL_WEIGHT_AI2H_SUCCESS +
+                    eval_metrics.get('human_to_ai_success_rate', 0) * EVAL_WEIGHT_H2A_SUCCESS
             )
 
             best_score = (
-                    self.best_metrics.get('ai_to_human_semantic_sim', 0) * 0.3 +
-                    self.best_metrics.get('ai_to_human_bleu', 0) * 0.2 +
-                    self.best_metrics.get('ai_to_human_success_rate', 0) * 0.4 +
-                    self.best_metrics.get('human_to_ai_success_rate', 0) * 0.1
+                    self.best_metrics.get('ai_to_human_semantic_sim', 0) * EVAL_WEIGHT_AI2H_SEMANTIC +
+                    self.best_metrics.get('ai_to_human_bleu', 0) * EVAL_WEIGHT_AI2H_BLEU +
+                    self.best_metrics.get('ai_to_human_success_rate', 0) * EVAL_WEIGHT_AI2H_SUCCESS +
+                    self.best_metrics.get('human_to_ai_success_rate', 0) * EVAL_WEIGHT_H2A_SUCCESS
             )
 
             if current_score > best_score:
@@ -1141,6 +1219,18 @@ def parse_args():
     parser.add_argument('--lambda_adv', type=float, default=2.0,
                         help='Weight for adversarial loss (default: 2.0)')
 
+    # 🚀 性能优化参数
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                        help='Gradient accumulation steps (default: 1)')
+    parser.add_argument('--use_amp', action='store_true',
+                        help='Use automatic mixed precision training')
+    parser.add_argument('--warmup_steps', type=int, default=500,
+                        help='Learning rate warmup steps (default: 500)')
+
+    # 🚀 生成参数
+    parser.add_argument('--max_samples_per_direction', type=int, default=10,
+                        help='Max samples per style transfer direction (default: 10)')
+
     return parser.parse_args()
 
 
@@ -1172,6 +1262,14 @@ def main():
         # 训练策略
         'd_train_interval': 3,
         'eval_interval': 1,
+
+        # 🚀 性能优化
+        'gradient_accumulation_steps': args.gradient_accumulation_steps,
+        'use_amp': args.use_amp,
+        'warmup_steps': args.warmup_steps,
+
+        # 🚀 生成配置
+        'max_samples_per_direction': args.max_samples_per_direction,
 
         # WandB配置
         'use_wandb': not args.no_wandb,
