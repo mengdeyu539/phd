@@ -6,7 +6,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from transformers import T5ForConditionalGeneration, T5Tokenizer, AutoModel, AutoTokenizer
+from transformers import T5ForConditionalGeneration, T5Tokenizer, AutoModel, AutoTokenizer, GPT2LMHeadModel, GPT2Tokenizer
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 import os
@@ -167,19 +167,155 @@ class StyleTransferDataset(Dataset):
         }
 
 
+# ===================== 困惑度计算器 =====================
+
+class PerplexityCalculator(nn.Module):
+    """
+    🚀 困惑度计算器
+    使用预训练语言模型计算文本的困惑度特征
+    AI生成的文本通常具有较低的困惑度（更流畅、可预测）
+    人类文本通常具有较高的困惑度（更多样、不可预测）
+    """
+    def __init__(self, model_name='gpt2', device='cuda', max_length=384):
+        super().__init__()
+        self.device = device
+        self.max_length = max_length
+
+        logger.info(f"加载困惑度计算模型: {model_name}...")
+        try:
+            self.model = GPT2LMHeadModel.from_pretrained(model_name).to(device)
+            self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+            self.model.eval()
+
+            # 设置 pad_token
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+            logger.info(f"✅ 困惑度计算模型加载成功")
+        except Exception as e:
+            logger.error(f"❌ 加载困惑度模型失败: {e}")
+            raise
+
+    def compute_perplexity(self, texts: List[str]) -> torch.Tensor:
+        """
+        计算文本的困惑度
+
+        Args:
+            texts: 文本列表
+
+        Returns:
+            perplexities: 困惑度张量 [batch_size]
+        """
+        self.model.eval()
+
+        # Tokenize
+        encodings = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors='pt'
+        ).to(self.device)
+
+        perplexities = []
+
+        with torch.no_grad():
+            for i in range(len(texts)):
+                input_ids = encodings['input_ids'][i:i+1]
+                attention_mask = encodings['attention_mask'][i:i+1]
+
+                # 获取实际长度（排除padding）
+                actual_length = attention_mask.sum().item()
+
+                if actual_length == 0:
+                    perplexities.append(float('inf'))
+                    continue
+
+                # 计算损失
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=input_ids
+                )
+
+                # 困惑度 = exp(loss)
+                loss = outputs.loss
+                perplexity = torch.exp(loss)
+                perplexities.append(perplexity.item())
+
+        return torch.tensor(perplexities, device=self.device)
+
+    def compute_perplexity_features(self, texts: List[str]) -> torch.Tensor:
+        """
+        计算更丰富的困惑度特征
+
+        Returns:
+            features: [batch_size, 4]
+                      包含 [perplexity, log_perplexity, perplexity_std, length_normalized_perplexity]
+        """
+        perplexities = self.compute_perplexity(texts)
+
+        # 计算多种困惑度特征
+        log_perplexity = torch.log(perplexities + 1e-8)  # 防止log(0)
+
+        # 归一化困惑度（按文本长度）
+        lengths = torch.tensor([len(text.split()) for text in texts], device=self.device, dtype=torch.float32)
+        normalized_perplexity = perplexities / (lengths + 1e-8)
+
+        # 计算统计特征（如果batch大于1）
+        if len(texts) > 1:
+            perplexity_std = perplexities.std()
+        else:
+            perplexity_std = torch.tensor(0.0, device=self.device)
+
+        perplexity_std = perplexity_std.expand(len(texts))
+
+        # 组合特征 [batch_size, 4]
+        features = torch.stack([
+            perplexities,
+            log_perplexity,
+            perplexity_std,
+            normalized_perplexity
+        ], dim=1)
+
+        return features
+
+
 # ===================== 判别器 =====================
 
 class StyleDiscriminator(nn.Module):
-    def __init__(self, vocab_size, hidden_dim=512, style_dim=256, dropout=0.3):
+    """
+    🚀 基于困惑度特征的判别器
+    结合困惑度特征和语义特征进行风格判别
+    """
+    def __init__(self, vocab_size, perplexity_calculator, hidden_dim=256, style_dim=128, dropout=0.3, use_perplexity=True):
         super().__init__()
 
-        # 🔧 修复：使用动态 vocab_size 而非硬编码
-        self.embedding = nn.Embedding(vocab_size, 256)
-        self.lstm = nn.LSTM(256, hidden_dim, num_layers=2,
+        self.use_perplexity = use_perplexity
+        self.perplexity_calculator = perplexity_calculator
+
+        # 🚀 轻量级语义特征提取器（简化版LSTM）
+        self.embedding = nn.Embedding(vocab_size, 128)  # 减小embedding维度
+        self.lstm = nn.LSTM(128, hidden_dim // 2, num_layers=1,  # 减少层数和维度
                             batch_first=True, bidirectional=True, dropout=dropout)
 
+        # 🚀 困惑度特征处理层
+        if self.use_perplexity:
+            self.perplexity_encoder = nn.Sequential(
+                nn.Linear(4, 32),  # 4个困惑度特征 -> 32维
+                nn.LayerNorm(32),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+
+            # 混合特征分类器：语义特征(hidden_dim) + 困惑度特征(32)
+            classifier_input_dim = hidden_dim + 32
+        else:
+            classifier_input_dim = hidden_dim
+
+        # 🚀 分类器
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * 2, style_dim),
+            nn.Linear(classifier_input_dim, style_dim),
             nn.LayerNorm(style_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -190,15 +326,36 @@ class StyleDiscriminator(nn.Module):
             nn.Linear(style_dim // 2, 2)
         )
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, texts=None):
+        """
+        Args:
+            input_ids: token ids
+            attention_mask: attention mask
+            texts: 原始文本列表（用于计算困惑度）
+
+        Returns:
+            logits: [batch_size, 2]
+        """
+        # 1. 提取语义特征
         embedded = self.embedding(input_ids)
         lstm_out, (h_n, c_n) = self.lstm(embedded)
 
         forward_hidden = h_n[-2, :, :]
         backward_hidden = h_n[-1, :, :]
-        hidden = torch.cat([forward_hidden, backward_hidden], dim=1)
+        semantic_features = torch.cat([forward_hidden, backward_hidden], dim=1)
 
-        logits = self.classifier(hidden)
+        # 2. 计算困惑度特征
+        if self.use_perplexity and texts is not None:
+            perplexity_features = self.perplexity_calculator.compute_perplexity_features(texts)
+            perplexity_features = self.perplexity_encoder(perplexity_features)
+
+            # 3. 融合特征
+            combined_features = torch.cat([semantic_features, perplexity_features], dim=1)
+        else:
+            combined_features = semantic_features
+
+        # 4. 分类
+        logits = self.classifier(combined_features)
         return logits
 
 
@@ -378,7 +535,12 @@ class EvaluationMetrics:
         ).to(device)
 
         with torch.no_grad():
-            logits = discriminator(inputs['input_ids'])
+            # 🚀 使用困惑度特征的判别器：传入texts参数
+            logits = discriminator(
+                inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
+                texts=texts
+            )
             predictions = logits.argmax(dim=1).cpu().numpy()
 
         target_styles = np.array(target_styles)
@@ -518,6 +680,7 @@ class ImprovedAdversarialTrainer:
         self.discriminator.train()
         self.d_optimizer.zero_grad()
 
+        # 🚀 Tokenize输入
         real_human_inputs = self.tokenizer(
             real_human_texts, padding=True, truncation=True,
             max_length=384, return_tensors='pt'
@@ -540,18 +703,35 @@ class ImprovedAdversarialTrainer:
 
         batch_size = len(real_human_texts)
 
-        real_human_logits = self.discriminator(real_human_inputs['input_ids'])
+        # 🚀 使用困惑度特征的判别器：传入texts参数
+        real_human_logits = self.discriminator(
+            real_human_inputs['input_ids'],
+            attention_mask=real_human_inputs['attention_mask'],
+            texts=real_human_texts
+        )
         real_human_labels = torch.zeros(batch_size, dtype=torch.long).to(self.device)
         loss_real_human = self.ce_loss(real_human_logits, real_human_labels)
 
-        real_ai_logits = self.discriminator(real_ai_inputs['input_ids'])
+        real_ai_logits = self.discriminator(
+            real_ai_inputs['input_ids'],
+            attention_mask=real_ai_inputs['attention_mask'],
+            texts=real_ai_texts
+        )
         real_ai_labels = torch.ones(batch_size, dtype=torch.long).to(self.device)
         loss_real_ai = self.ce_loss(real_ai_logits, real_ai_labels)
 
-        fake_human_logits = self.discriminator(fake_human_inputs['input_ids'])
+        fake_human_logits = self.discriminator(
+            fake_human_inputs['input_ids'],
+            attention_mask=fake_human_inputs['attention_mask'],
+            texts=fake_human_texts
+        )
         loss_fake_human = self.ce_loss(fake_human_logits, real_human_labels)
 
-        fake_ai_logits = self.discriminator(fake_ai_inputs['input_ids'])
+        fake_ai_logits = self.discriminator(
+            fake_ai_inputs['input_ids'],
+            attention_mask=fake_ai_inputs['attention_mask'],
+            texts=fake_ai_texts
+        )
         loss_fake_ai = self.ce_loss(fake_ai_logits, real_ai_labels)
 
         d_loss = loss_real_human + loss_real_ai + loss_fake_human + loss_fake_ai
@@ -619,7 +799,12 @@ class ImprovedAdversarialTrainer:
                 max_length=384, return_tensors='pt'
             ).to(self.device)
 
-            fake_logits = self.discriminator(gen_inputs['input_ids'])
+            # 🚀 使用困惑度特征的判别器：传入生成的文本
+            fake_logits = self.discriminator(
+                gen_inputs['input_ids'],
+                attention_mask=gen_inputs['attention_mask'],
+                texts=generated_texts
+            )
             adv_loss = self.ce_loss(fake_logits, target_style)
 
             # 总损失
@@ -1109,12 +1294,31 @@ def train_worker(rank, world_size, config, datasets):
         device=rank
     )
 
+    # 🚀 创建困惑度计算器（只在主进程打印日志）
+    perplexity_model_name = config.get('perplexity_model', 'gpt2')
+    if rank == 0:
+        logger.info(f"🔧 初始化困惑度计算器: {perplexity_model_name}")
+
+    perplexity_calculator = PerplexityCalculator(
+        model_name=perplexity_model_name,
+        device=rank,
+        max_length=config['max_length']
+    )
+
     # 🔧 修复：从 tokenizer 获取词汇表大小
     vocab_size = len(generator.tokenizer)
+
+    # 🚀 创建基于困惑度的判别器
+    use_perplexity = config.get('use_perplexity_discriminator', True)
+    if rank == 0:
+        logger.info(f"🔧 判别器使用困惑度特征: {use_perplexity}")
+
     discriminator = StyleDiscriminator(
         vocab_size=vocab_size,
-        hidden_dim=512,
-        style_dim=256
+        perplexity_calculator=perplexity_calculator,
+        hidden_dim=256,
+        style_dim=128,
+        use_perplexity=use_perplexity
     )
 
     # 创建数据集
@@ -1231,6 +1435,12 @@ def parse_args():
     parser.add_argument('--max_samples_per_direction', type=int, default=10,
                         help='Max samples per style transfer direction (default: 10)')
 
+    # 🚀 困惑度判别器参数
+    parser.add_argument('--perplexity_model', type=str, default='gpt2',
+                        help='Perplexity calculator model (default: gpt2)')
+    parser.add_argument('--no_perplexity', action='store_true',
+                        help='Disable perplexity features in discriminator')
+
     return parser.parse_args()
 
 
@@ -1271,6 +1481,10 @@ def main():
         # 🚀 生成配置
         'max_samples_per_direction': args.max_samples_per_direction,
 
+        # 🚀 困惑度判别器配置
+        'perplexity_model': args.perplexity_model,
+        'use_perplexity_discriminator': not args.no_perplexity,
+
         # WandB配置
         'use_wandb': not args.no_wandb,
         'wandb_project': args.wandb_project,
@@ -1299,6 +1513,8 @@ def main():
     logger.info(f"损失权重: Recon={config['lambda_reconstruction']}, Adv={config['lambda_adv']}, "
                 f"Semantic={config['lambda_semantic']}, Length={config['lambda_length']}")
     logger.info(f"评估权重: AI→Human成功率=40%, 语义=30%, BLEU=20%, Human→AI=10%")
+    logger.info(f"🚀 困惑度判别器: {'启用' if config['use_perplexity_discriminator'] else '禁用'} "
+                f"(模型: {config['perplexity_model']})")
     logger.info(f"{'=' * 80}\n")
 
     if world_size > 1:
