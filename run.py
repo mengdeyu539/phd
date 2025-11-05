@@ -333,13 +333,15 @@ class EvaluationMetrics:
         reference_tokens = reference.lower().split()
         hypothesis_tokens = hypothesis.lower().split()
 
+        # 🔧 修复：使用具体的异常类型，便于调试
         try:
             score = sentence_bleu(
                 [reference_tokens],
                 hypothesis_tokens,
                 smoothing_function=self.smoothing.method1
             )
-        except:
+        except (ValueError, ZeroDivisionError, AttributeError) as e:
+            logger.warning(f"BLEU计算失败: {e}, 返回0.0")
             score = 0.0
 
         return score
@@ -551,26 +553,14 @@ class ImprovedAdversarialTrainer:
         )
         reconstruction_loss = outputs.loss
 
-        # 生成文本
+        # 🔧 优化：批量生成文本（使用平均长度作为目标）
         with torch.no_grad():
-            generated_ids_list = []
-            for i in range(len(texts)):
-                single_input = input_ids[i:i + 1]
-                single_mask = attention_mask[i:i + 1]
-                target_len = original_lengths[i].item()
+            avg_target_len = int(original_lengths.float().mean().item())
 
-                gen_ids = self.generator_model.generate_text(
-                    single_input, single_mask, target_length=target_len
-                )
-                generated_ids_list.append(gen_ids[0])
-
-            max_gen_len = max(len(ids) for ids in generated_ids_list)
-            generated_ids = torch.zeros(
-                len(generated_ids_list), max_gen_len, dtype=torch.long
-            ).to(self.device)
-
-            for i, ids in enumerate(generated_ids_list):
-                generated_ids[i, :len(ids)] = ids
+            # 批量生成
+            generated_ids = self.generator_model.generate_text(
+                input_ids, attention_mask, target_length=avg_target_len
+            )
 
         generated_texts = [
             self.tokenizer.decode(ids, skip_special_tokens=True)
@@ -645,15 +635,16 @@ class ImprovedAdversarialTrainer:
             # 生成假样本
             self.generator.eval()
             with torch.no_grad():
-                # ⭐ AI→Human: 生成更多样本（增加到12个，原来是8个）
+                # 🔧 修复：平衡样本数量，避免判别器偏向某一类
+                max_samples = 10  # 统一使用10个样本
+
                 fake_human_texts = []
-                for text in ai_texts[:min(len(ai_texts), 12)]:
+                for text in ai_texts[:min(len(ai_texts), max_samples)]:
                     fake_human = self.generator_model.generate_with_style(text, 0, preserve_length=True)
                     fake_human_texts.append(fake_human)
 
-                # Human→AI: 保持原样本数量
                 fake_ai_texts = []
-                for text in human_texts[:min(len(human_texts), 8)]:
+                for text in human_texts[:min(len(human_texts), max_samples)]:
                     fake_ai = self.generator_model.generate_with_style(text, 1, preserve_length=True)
                     fake_ai_texts.append(fake_ai)
 
@@ -1078,11 +1069,18 @@ def train_worker(rank, world_size, config, datasets):
         shuffle=False
     )
 
+    # 🔧 修复：根据GPU数量动态调整num_workers，避免资源竞争
+    import multiprocessing
+    cpu_count = multiprocessing.cpu_count()
+    # 总workers限制在8以内，然后均分给各GPU
+    total_workers = min(cpu_count, 8)
+    num_workers_per_gpu = max(2, total_workers // world_size)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
         sampler=train_sampler,
-        num_workers=4,
+        num_workers=num_workers_per_gpu,
         pin_memory=True
     )
 
@@ -1090,7 +1088,7 @@ def train_worker(rank, world_size, config, datasets):
         dev_dataset,
         batch_size=config['batch_size'],
         sampler=dev_sampler,
-        num_workers=4,
+        num_workers=num_workers_per_gpu,
         pin_memory=True
     )
 
