@@ -187,11 +187,15 @@ class PerplexityCalculator(nn.Module):
             self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
             self.model.eval()
 
+            # 🔧 冻结所有参数，避免DDP训练时的梯度问题
+            for param in self.model.parameters():
+                param.requires_grad = False
+
             # 设置 pad_token
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
-            logger.info(f"✅ 困惑度计算模型加载成功")
+            logger.info(f"✅ 困惑度计算模型加载成功（参数已冻结）")
         except Exception as e:
             logger.error(f"❌ 加载困惑度模型失败: {e}")
             raise
@@ -563,7 +567,8 @@ class ImprovedAdversarialTrainer:
 
         if world_size > 1:
             self.generator = DDP(generator, device_ids=[rank], find_unused_parameters=True)
-            self.discriminator = DDP(discriminator, device_ids=[rank])
+            # 🔧 添加 find_unused_parameters=True，因为困惑度计算器的参数不参与梯度计算
+            self.discriminator = DDP(discriminator, device_ids=[rank], find_unused_parameters=True)
 
         # ⭐ 创建便捷属性来访问实际模型
         if world_size > 1:
