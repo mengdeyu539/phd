@@ -34,10 +34,24 @@ logger = logging.getLogger(__name__)
 
 # ===================== 多卡训练工具函数 =====================
 
-def setup_distributed(rank: int, world_size: int) -> None:
+def find_free_port() -> int:
+    """🚀 查找可用的网络端口"""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+    return port
+
+
+def setup_distributed(rank: int, world_size: int, master_port: int = None) -> None:
     """🚀 初始化分布式训练环境"""
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+
+    # 🔧 使用传入的端口或默认端口
+    if master_port is None:
+        master_port = 12355
+    os.environ['MASTER_PORT'] = str(master_port)
 
     # ⭐ 增加NCCL超时时间（默认10分钟，增加到30分钟）
     os.environ['NCCL_TIMEOUT'] = '1800'
@@ -53,7 +67,7 @@ def setup_distributed(rank: int, world_size: int) -> None:
     torch.cuda.set_device(rank)
 
     if rank == 0:
-        logger.info(f"✅ 分布式环境初始化完成 (超时时间: 1800秒)")
+        logger.info(f"✅ 分布式环境初始化完成 (端口: {master_port}, 超时: 1800秒)")
 
 
 def cleanup_distributed() -> None:
@@ -1324,10 +1338,11 @@ class ImprovedAdversarialTrainer:
 
 # ===================== 多卡训练主函数 =====================
 
-def train_worker(rank, world_size, config, datasets):
+def train_worker(rank, world_size, config, datasets, master_port):
     """每个GPU进程的训练函数"""
-    # 设置分布式环境
-    setup_distributed(rank, world_size)
+    # 🔧 只在多卡时设置分布式环境
+    if world_size > 1:
+        setup_distributed(rank, world_size, master_port)
 
     # 设置随机种子
     torch.manual_seed(config['seed'] + rank)
@@ -1435,8 +1450,9 @@ def train_worker(rank, world_size, config, datasets):
     # 开始训练
     trainer.train()
 
-    # 清理
-    cleanup_distributed()
+    # 🔧 只在多卡时清理分布式环境
+    if world_size > 1:
+        cleanup_distributed()
 
 
 def parse_args():
@@ -1571,16 +1587,19 @@ def main():
     logger.info(f"{'=' * 80}\n")
 
     if world_size > 1:
-        logger.info("🚀 启动多卡训练...")
+        # 🔧 查找可用端口，避免端口冲突
+        master_port = find_free_port()
+        logger.info(f"🚀 启动多卡训练 (使用端口: {master_port})...")
         mp.spawn(
             train_worker,
-            args=(world_size, config, datasets),
+            args=(world_size, config, datasets, master_port),
             nprocs=world_size,
             join=True
         )
     else:
         logger.info("🚀 启动单卡训练...")
-        train_worker(0, 1, config, datasets)
+        # 单卡不需要分布式，使用None作为master_port
+        train_worker(0, 1, config, datasets, None)
 
 
 if __name__ == "__main__":
