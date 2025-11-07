@@ -200,64 +200,85 @@ class PerplexityCalculator(nn.Module):
             logger.error(f"❌ 加载困惑度模型失败: {e}")
             raise
 
-    def compute_perplexity(self, texts: List[str]) -> torch.Tensor:
+    def compute_perplexity(self, texts: List[str], batch_size: int = 8, show_progress: bool = False) -> torch.Tensor:
         """
-        计算文本的困惑度
+        计算文本的困惑度（优化批量处理）
 
         Args:
             texts: 文本列表
+            batch_size: 批量处理大小
+            show_progress: 是否显示进度
 
         Returns:
             perplexities: 困惑度张量 [batch_size]
         """
         self.model.eval()
-
-        # Tokenize
-        encodings = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors='pt'
-        ).to(self.device)
-
         perplexities = []
 
+        # 🚀 批量处理
+        num_batches = (len(texts) + batch_size - 1) // batch_size
+
+        iterator = range(0, len(texts), batch_size)
+        if show_progress:
+            from tqdm import tqdm
+            iterator = tqdm(iterator, desc="计算困惑度", total=num_batches, leave=False)
+
         with torch.no_grad():
-            for i in range(len(texts)):
-                input_ids = encodings['input_ids'][i:i+1]
-                attention_mask = encodings['attention_mask'][i:i+1]
+            for start_idx in iterator:
+                end_idx = min(start_idx + batch_size, len(texts))
+                batch_texts = texts[start_idx:end_idx]
 
-                # 获取实际长度（排除padding）
-                actual_length = attention_mask.sum().item()
+                # Tokenize batch
+                encodings = self.tokenizer(
+                    batch_texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors='pt'
+                ).to(self.device)
 
-                if actual_length == 0:
-                    perplexities.append(float('inf'))
-                    continue
+                # 🚀 批量计算每个样本的困惑度
+                for i in range(len(batch_texts)):
+                    input_ids = encodings['input_ids'][i:i+1]
+                    attention_mask = encodings['attention_mask'][i:i+1]
 
-                # 计算损失
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=input_ids
-                )
+                    # 获取实际长度（排除padding）
+                    actual_length = attention_mask.sum().item()
 
-                # 困惑度 = exp(loss)
-                loss = outputs.loss
-                perplexity = torch.exp(loss)
-                perplexities.append(perplexity.item())
+                    if actual_length == 0:
+                        perplexities.append(float('inf'))
+                        continue
+
+                    # 计算损失
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=input_ids
+                    )
+
+                    # 困惑度 = exp(loss)
+                    loss = outputs.loss
+                    perplexity = torch.exp(loss)
+                    perplexities.append(perplexity.item())
 
         return torch.tensor(perplexities, device=self.device)
 
-    def compute_perplexity_features(self, texts: List[str]) -> torch.Tensor:
+    def compute_perplexity_features(self, texts: List[str], show_progress: bool = False) -> torch.Tensor:
         """
         计算更丰富的困惑度特征
+
+        Args:
+            texts: 文本列表
+            show_progress: 是否显示进度条
 
         Returns:
             features: [batch_size, 4]
                       包含 [perplexity, log_perplexity, perplexity_std, length_normalized_perplexity]
         """
-        perplexities = self.compute_perplexity(texts)
+        # 🚀 根据批次大小决定是否显示进度
+        # 评估时批次较大，训练时批次较小
+        batch_size = 16 if len(texts) > 50 else 8
+        perplexities = self.compute_perplexity(texts, batch_size=batch_size, show_progress=show_progress)
 
         # 计算多种困惑度特征
         log_perplexity = torch.log(perplexities + 1e-8)  # 防止log(0)
@@ -350,7 +371,12 @@ class StyleDiscriminator(nn.Module):
 
         # 2. 计算困惑度特征
         if self.use_perplexity and texts is not None:
-            perplexity_features = self.perplexity_calculator.compute_perplexity_features(texts)
+            # 🚀 在评估模式下显示进度（批次较大时）
+            show_progress = not self.training and len(texts) > 50
+            perplexity_features = self.perplexity_calculator.compute_perplexity_features(
+                texts,
+                show_progress=show_progress
+            )
             perplexity_features = self.perplexity_encoder(perplexity_features)
 
             # 3. 融合特征
@@ -528,7 +554,11 @@ class EvaluationMetrics:
         return scores
 
     def evaluate_style_transfer(self, discriminator, tokenizer, texts, target_styles, device):
+        """评估风格转换成功率（使用判别器）"""
         discriminator.eval()
+
+        # 🚀 添加日志，避免用户以为卡住
+        logger.info(f"  正在使用判别器评估 {len(texts)} 个样本（含困惑度计算）...")
 
         inputs = tokenizer(
             texts,
@@ -540,6 +570,7 @@ class EvaluationMetrics:
 
         with torch.no_grad():
             # 🚀 使用困惑度特征的判别器：传入texts参数
+            # 注意：这里会调用困惑度计算，可能较慢
             logits = discriminator(
                 inputs['input_ids'],
                 attention_mask=inputs['attention_mask'],
@@ -550,6 +581,7 @@ class EvaluationMetrics:
         target_styles = np.array(target_styles)
         success_rate = (predictions == target_styles).mean()
 
+        logger.info(f"  ✅ 判别器评估完成，成功率: {success_rate:.1%}")
         return success_rate, predictions
 
 
@@ -977,8 +1009,14 @@ class ImprovedAdversarialTrainer:
         save_dir = os.path.join(self.config['output_dir'], f'epoch_{epoch}_results')
         os.makedirs(save_dir, exist_ok=True)
 
+        # 🚀 限制评估样本数量以加快速度（可配置）
+        max_eval_samples = self.config.get('max_eval_samples', None)
+
         # ===== AI → Human =====
         ai_texts = self.dev_data.get('ai_texts', [])
+        if max_eval_samples is not None and len(ai_texts) > max_eval_samples:
+            logger.info(f"  ⚡ 限制AI→Human评估样本数: {len(ai_texts)} -> {max_eval_samples}")
+            ai_texts = ai_texts[:max_eval_samples]
         ai_originals = []
         ai_generated = []
         ai_results = []
@@ -1021,6 +1059,9 @@ class ImprovedAdversarialTrainer:
 
         # ===== Human → AI =====
         human_texts = self.dev_data.get('human_texts', [])
+        if max_eval_samples is not None and len(human_texts) > max_eval_samples:
+            logger.info(f"  ⚡ 限制Human→AI评估样本数: {len(human_texts)} -> {max_eval_samples}")
+            human_texts = human_texts[:max_eval_samples]
         human_originals = []
         human_generated = []
         human_results = []
@@ -1446,6 +1487,10 @@ def parse_args():
     parser.add_argument('--no_perplexity', action='store_true',
                         help='Disable perplexity features in discriminator')
 
+    # 🚀 评估参数
+    parser.add_argument('--max_eval_samples', type=int, default=None,
+                        help='Maximum number of samples to evaluate per direction (default: None, use all)')
+
     return parser.parse_args()
 
 
@@ -1489,6 +1534,9 @@ def main():
         # 🚀 困惑度判别器配置
         'perplexity_model': args.perplexity_model,
         'use_perplexity_discriminator': not args.no_perplexity,
+
+        # 🚀 评估配置
+        'max_eval_samples': args.max_eval_samples,
 
         # WandB配置
         'use_wandb': not args.no_wandb,
