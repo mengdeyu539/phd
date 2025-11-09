@@ -6,7 +6,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from transformers import T5ForConditionalGeneration, T5Tokenizer, AutoModel, AutoTokenizer
+from transformers import T5ForConditionalGeneration, T5Tokenizer, AutoModel, AutoTokenizer, GPT2LMHeadModel, GPT2Tokenizer
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 import os
@@ -34,10 +34,24 @@ logger = logging.getLogger(__name__)
 
 # ===================== 多卡训练工具函数 =====================
 
-def setup_distributed(rank, world_size):
-    """初始化分布式训练环境"""
+def find_free_port() -> int:
+    """🚀 查找可用的网络端口"""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+    return port
+
+
+def setup_distributed(rank: int, world_size: int, master_port: int = None) -> None:
+    """🚀 初始化分布式训练环境"""
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+
+    # 🔧 使用传入的端口或默认端口
+    if master_port is None:
+        master_port = 12355
+    os.environ['MASTER_PORT'] = str(master_port)
 
     # ⭐ 增加NCCL超时时间（默认10分钟，增加到30分钟）
     os.environ['NCCL_TIMEOUT'] = '1800'
@@ -53,22 +67,23 @@ def setup_distributed(rank, world_size):
     torch.cuda.set_device(rank)
 
     if rank == 0:
-        logger.info(f"✅ 分布式环境初始化完成 (超时时间: 1800秒)")
+        logger.info(f"✅ 分布式环境初始化完成 (端口: {master_port}, 超时: 1800秒)")
 
 
-def cleanup_distributed():
-    """清理分布式训练环境"""
+def cleanup_distributed() -> None:
+    """🚀 清理分布式训练环境"""
     dist.destroy_process_group()
 
 
-def is_main_process(rank):
-    """判断是否为主进程"""
+def is_main_process(rank: int) -> bool:
+    """🚀 判断是否为主进程"""
     return rank == 0
 
 
 # ===================== 数据加载 =====================
 
-def load_text_data(file_path):
+def load_text_data(file_path: str) -> List[str]:
+    """🚀 加载文本数据"""
     texts = []
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -78,7 +93,7 @@ def load_text_data(file_path):
     return texts
 
 
-def load_style_datasets(data_dir):
+def load_style_datasets(data_dir: str) -> Dict[str, Dict]:
     datasets = {}
 
     train_human = load_text_data(os.path.join(data_dir, 'train.human'))
@@ -166,18 +181,180 @@ class StyleTransferDataset(Dataset):
         }
 
 
+# ===================== 困惑度计算器 =====================
+
+class PerplexityCalculator(nn.Module):
+    """
+    🚀 困惑度计算器
+    使用预训练语言模型计算文本的困惑度特征
+    AI生成的文本通常具有较低的困惑度（更流畅、可预测）
+    人类文本通常具有较高的困惑度（更多样、不可预测）
+    """
+    def __init__(self, model_name='gpt2', device='cuda', max_length=384):
+        super().__init__()
+        self.device = device
+        self.max_length = max_length
+
+        logger.info(f"加载困惑度计算模型: {model_name}...")
+        try:
+            self.model = GPT2LMHeadModel.from_pretrained(model_name).to(device)
+            self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+            self.model.eval()
+
+            # 🔧 冻结所有参数，避免DDP训练时的梯度问题
+            for param in self.model.parameters():
+                param.requires_grad = False
+
+            # 设置 pad_token
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+            logger.info(f"✅ 困惑度计算模型加载成功（参数已冻结）")
+        except Exception as e:
+            logger.error(f"❌ 加载困惑度模型失败: {e}")
+            raise
+
+    def compute_perplexity(self, texts: List[str], batch_size: int = 8, show_progress: bool = False) -> torch.Tensor:
+        """
+        计算文本的困惑度（优化批量处理）
+
+        Args:
+            texts: 文本列表
+            batch_size: 批量处理大小
+            show_progress: 是否显示进度
+
+        Returns:
+            perplexities: 困惑度张量 [batch_size]
+        """
+        self.model.eval()
+        perplexities = []
+
+        # 🚀 批量处理
+        num_batches = (len(texts) + batch_size - 1) // batch_size
+
+        iterator = range(0, len(texts), batch_size)
+        if show_progress:
+            from tqdm import tqdm
+            iterator = tqdm(iterator, desc="计算困惑度", total=num_batches, leave=False)
+
+        with torch.no_grad():
+            for start_idx in iterator:
+                end_idx = min(start_idx + batch_size, len(texts))
+                batch_texts = texts[start_idx:end_idx]
+
+                # Tokenize batch
+                encodings = self.tokenizer(
+                    batch_texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors='pt'
+                ).to(self.device)
+
+                # 🚀 批量计算每个样本的困惑度
+                for i in range(len(batch_texts)):
+                    input_ids = encodings['input_ids'][i:i+1]
+                    attention_mask = encodings['attention_mask'][i:i+1]
+
+                    # 获取实际长度（排除padding）
+                    actual_length = attention_mask.sum().item()
+
+                    if actual_length == 0:
+                        perplexities.append(float('inf'))
+                        continue
+
+                    # 计算损失
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=input_ids
+                    )
+
+                    # 困惑度 = exp(loss)
+                    loss = outputs.loss
+                    perplexity = torch.exp(loss)
+                    perplexities.append(perplexity.item())
+
+        return torch.tensor(perplexities, device=self.device)
+
+    def compute_perplexity_features(self, texts: List[str], show_progress: bool = False) -> torch.Tensor:
+        """
+        计算更丰富的困惑度特征
+
+        Args:
+            texts: 文本列表
+            show_progress: 是否显示进度条
+
+        Returns:
+            features: [batch_size, 4]
+                      包含 [perplexity, log_perplexity, perplexity_std, length_normalized_perplexity]
+        """
+        # 🚀 根据批次大小决定是否显示进度
+        # 评估时批次较大，训练时批次较小
+        batch_size = 16 if len(texts) > 50 else 8
+        perplexities = self.compute_perplexity(texts, batch_size=batch_size, show_progress=show_progress)
+
+        # 计算多种困惑度特征
+        log_perplexity = torch.log(perplexities + 1e-8)  # 防止log(0)
+
+        # 归一化困惑度（按文本长度）
+        lengths = torch.tensor([len(text.split()) for text in texts], device=self.device, dtype=torch.float32)
+        normalized_perplexity = perplexities / (lengths + 1e-8)
+
+        # 计算统计特征（如果batch大于1）
+        if len(texts) > 1:
+            perplexity_std = perplexities.std()
+        else:
+            perplexity_std = torch.tensor(0.0, device=self.device)
+
+        perplexity_std = perplexity_std.expand(len(texts))
+
+        # 组合特征 [batch_size, 4]
+        features = torch.stack([
+            perplexities,
+            log_perplexity,
+            perplexity_std,
+            normalized_perplexity
+        ], dim=1)
+
+        return features
+
+
 # ===================== 判别器 =====================
 
 class StyleDiscriminator(nn.Module):
-    def __init__(self, hidden_dim=512, style_dim=256, dropout=0.3):
+    """
+    🚀 基于困惑度特征的判别器
+    结合困惑度特征和语义特征进行风格判别
+    """
+    def __init__(self, vocab_size, perplexity_calculator, hidden_dim=256, style_dim=128, dropout=0.3, use_perplexity=True):
         super().__init__()
 
-        self.embedding = nn.Embedding(32100, 256)
-        self.lstm = nn.LSTM(256, hidden_dim, num_layers=2,
+        self.use_perplexity = use_perplexity
+        self.perplexity_calculator = perplexity_calculator
+
+        # 🚀 轻量级语义特征提取器（简化版LSTM）
+        self.embedding = nn.Embedding(vocab_size, 128)  # 减小embedding维度
+        self.lstm = nn.LSTM(128, hidden_dim // 2, num_layers=1,  # 减少层数和维度
                             batch_first=True, bidirectional=True, dropout=dropout)
 
+        # 🚀 困惑度特征处理层
+        if self.use_perplexity:
+            self.perplexity_encoder = nn.Sequential(
+                nn.Linear(4, 32),  # 4个困惑度特征 -> 32维
+                nn.LayerNorm(32),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+
+            # 混合特征分类器：语义特征(hidden_dim) + 困惑度特征(32)
+            classifier_input_dim = hidden_dim + 32
+        else:
+            classifier_input_dim = hidden_dim
+
+        # 🚀 分类器
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * 2, style_dim),
+            nn.Linear(classifier_input_dim, style_dim),
             nn.LayerNorm(style_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -188,15 +365,41 @@ class StyleDiscriminator(nn.Module):
             nn.Linear(style_dim // 2, 2)
         )
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, texts=None):
+        """
+        Args:
+            input_ids: token ids
+            attention_mask: attention mask
+            texts: 原始文本列表（用于计算困惑度）
+
+        Returns:
+            logits: [batch_size, 2]
+        """
+        # 1. 提取语义特征
         embedded = self.embedding(input_ids)
         lstm_out, (h_n, c_n) = self.lstm(embedded)
 
         forward_hidden = h_n[-2, :, :]
         backward_hidden = h_n[-1, :, :]
-        hidden = torch.cat([forward_hidden, backward_hidden], dim=1)
+        semantic_features = torch.cat([forward_hidden, backward_hidden], dim=1)
 
-        logits = self.classifier(hidden)
+        # 2. 计算困惑度特征
+        if self.use_perplexity and texts is not None:
+            # 🚀 在评估模式下显示进度（批次较大时）
+            show_progress = not self.training and len(texts) > 50
+            perplexity_features = self.perplexity_calculator.compute_perplexity_features(
+                texts,
+                show_progress=show_progress
+            )
+            perplexity_features = self.perplexity_encoder(perplexity_features)
+
+            # 3. 融合特征
+            combined_features = torch.cat([semantic_features, perplexity_features], dim=1)
+        else:
+            combined_features = semantic_features
+
+        # 4. 分类
+        logits = self.classifier(combined_features)
         return logits
 
 
@@ -218,28 +421,40 @@ class T5StyleGenerator(nn.Module):
         )
         return outputs
 
-    def generate_text(self, input_ids, attention_mask, target_length=None, max_length=384):
+    def generate_text(self, input_ids, attention_mask, target_length=None, max_length=384,
+                      min_length_ratio=0.8, max_length_ratio=1.2, min_abs_length=10,
+                      default_min_length=20, temperature=0.9, top_k=50, top_p=0.95,
+                      repetition_penalty=1.2, no_repeat_ngram_size=3):
+        """
+        🚀 生成文本（配置化参数）
+
+        Args:
+            min_length_ratio: 最小长度比例（默认0.8）
+            max_length_ratio: 最大长度比例（默认1.2）
+            min_abs_length: 最小绝对长度（默认10）
+            default_min_length: 无目标长度时的默认最小长度（默认20）
+        """
         if target_length is not None:
-            min_len = max(10, int(target_length * 0.8))
-            max_len = min(max_length, int(target_length * 1.2))
+            min_len = max(min_abs_length, int(target_length * min_length_ratio))
+            max_len = min(max_length, int(target_length * max_length_ratio))
         else:
-            min_len = 20
+            min_len = default_min_length
             max_len = max_length
 
+        # 🔧 修复：移除 beam search，使用 nucleus sampling 避免参数冲突
+        # num_beams 和 do_sample=True 不应同时使用
         outputs = self.t5.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_length=max_len,
             min_length=min_len,
-            num_beams=5,
-            no_repeat_ngram_size=3,
-            early_stopping=True,
-            temperature=0.9,
-            top_k=50,
-            top_p=0.95,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
             do_sample=True,
-            repetition_penalty=1.2,
-            length_penalty=1.2
+            repetition_penalty=repetition_penalty,
+            length_penalty=1.0  # 降低 length_penalty，因为没有 beam search
         )
         return outputs
 
@@ -332,13 +547,15 @@ class EvaluationMetrics:
         reference_tokens = reference.lower().split()
         hypothesis_tokens = hypothesis.lower().split()
 
+        # 🔧 修复：使用具体的异常类型，便于调试
         try:
             score = sentence_bleu(
                 [reference_tokens],
                 hypothesis_tokens,
                 smoothing_function=self.smoothing.method1
             )
-        except:
+        except (ValueError, ZeroDivisionError, AttributeError) as e:
+            logger.warning(f"BLEU计算失败: {e}, 返回0.0")
             score = 0.0
 
         return score
@@ -351,7 +568,11 @@ class EvaluationMetrics:
         return scores
 
     def evaluate_style_transfer(self, discriminator, tokenizer, texts, target_styles, device):
+        """评估风格转换成功率（使用判别器）"""
         discriminator.eval()
+
+        # 🚀 添加日志，避免用户以为卡住
+        logger.info(f"  正在使用判别器评估 {len(texts)} 个样本（含困惑度计算）...")
 
         inputs = tokenizer(
             texts,
@@ -362,12 +583,19 @@ class EvaluationMetrics:
         ).to(device)
 
         with torch.no_grad():
-            logits = discriminator(inputs['input_ids'])
+            # 🚀 使用困惑度特征的判别器：传入texts参数
+            # 注意：这里会调用困惑度计算，可能较慢
+            logits = discriminator(
+                inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
+                texts=texts
+            )
             predictions = logits.argmax(dim=1).cpu().numpy()
 
         target_styles = np.array(target_styles)
         success_rate = (predictions == target_styles).mean()
 
+        logger.info(f"  ✅ 判别器评估完成，成功率: {success_rate:.1%}")
         return success_rate, predictions
 
 
@@ -385,7 +613,8 @@ class ImprovedAdversarialTrainer:
 
         if world_size > 1:
             self.generator = DDP(generator, device_ids=[rank], find_unused_parameters=True)
-            self.discriminator = DDP(discriminator, device_ids=[rank])
+            # 🔧 添加 find_unused_parameters=True，因为困惑度计算器的参数不参与梯度计算
+            self.discriminator = DDP(discriminator, device_ids=[rank], find_unused_parameters=True)
 
         # ⭐ 创建便捷属性来访问实际模型
         if world_size > 1:
@@ -401,9 +630,8 @@ class ImprovedAdversarialTrainer:
         self.device = rank
         self.dev_data = dev_data
 
-        # 评估工具（只在主进程创建）
-        if self.is_main:
-            self.evaluator = EvaluationMetrics(device=rank)
+        # 🔧 修复：所有进程都创建 evaluator，确保语义损失计算正确
+        self.evaluator = EvaluationMetrics(device=rank)
 
         # ⭐ 初始化WandB（只在主进程）
         if config.get('use_wandb', True) and self.is_main:
@@ -432,18 +660,36 @@ class ImprovedAdversarialTrainer:
             betas=(0.5, 0.999)
         )
 
-        # 学习率调度器
+        # 🚀 学习率调度器（带预热）
+        self.warmup_steps = config.get('warmup_steps', 500)
+        self.total_steps = len(train_loader) * config['num_epochs']
+        self.current_step = 0
+
+        # 使用CosineAnnealingLR with warmup
         self.g_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.g_optimizer, T_max=len(train_loader) * config['num_epochs']
+            self.g_optimizer, T_max=self.total_steps - self.warmup_steps
         )
         self.d_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.d_optimizer, T_max=len(train_loader) * config['num_epochs']
+            self.d_optimizer, T_max=self.total_steps - self.warmup_steps
         )
+
+        if self.is_main and self.warmup_steps > 0:
+            logger.info(f"✅ 学习率预热: {self.warmup_steps} steps")
 
         # ⭐ 获取tokenizer
         self.tokenizer = self.generator_model.tokenizer
 
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
+
+        # 🚀 梯度累积支持
+        self.gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+        self.accumulation_counter = 0
+
+        # 🚀 混合精度训练支持
+        self.use_amp = config.get('use_amp', False)
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        if self.use_amp and self.is_main:
+            logger.info("✅ 启用混合精度训练 (AMP)")
 
         # ⭐ 追踪最佳指标 - 重点关注AI→Human
         self.best_metrics = {
@@ -472,9 +718,7 @@ class ImprovedAdversarialTrainer:
         return length_loss
 
     def compute_semantic_loss(self, original_texts, generated_texts):
-        if not self.is_main:
-            return torch.tensor(0.0, device=self.device)
-
+        # 🔧 修复：所有进程都计算语义损失，确保梯度一致性
         similarities = self.evaluator.compute_semantic_similarity(
             original_texts,
             generated_texts
@@ -487,6 +731,7 @@ class ImprovedAdversarialTrainer:
         self.discriminator.train()
         self.d_optimizer.zero_grad()
 
+        # 🚀 Tokenize输入
         real_human_inputs = self.tokenizer(
             real_human_texts, padding=True, truncation=True,
             max_length=384, return_tensors='pt'
@@ -509,18 +754,35 @@ class ImprovedAdversarialTrainer:
 
         batch_size = len(real_human_texts)
 
-        real_human_logits = self.discriminator(real_human_inputs['input_ids'])
+        # 🚀 使用困惑度特征的判别器：传入texts参数
+        real_human_logits = self.discriminator(
+            real_human_inputs['input_ids'],
+            attention_mask=real_human_inputs['attention_mask'],
+            texts=real_human_texts
+        )
         real_human_labels = torch.zeros(batch_size, dtype=torch.long).to(self.device)
         loss_real_human = self.ce_loss(real_human_logits, real_human_labels)
 
-        real_ai_logits = self.discriminator(real_ai_inputs['input_ids'])
+        real_ai_logits = self.discriminator(
+            real_ai_inputs['input_ids'],
+            attention_mask=real_ai_inputs['attention_mask'],
+            texts=real_ai_texts
+        )
         real_ai_labels = torch.ones(batch_size, dtype=torch.long).to(self.device)
         loss_real_ai = self.ce_loss(real_ai_logits, real_ai_labels)
 
-        fake_human_logits = self.discriminator(fake_human_inputs['input_ids'])
+        fake_human_logits = self.discriminator(
+            fake_human_inputs['input_ids'],
+            attention_mask=fake_human_inputs['attention_mask'],
+            texts=fake_human_texts
+        )
         loss_fake_human = self.ce_loss(fake_human_logits, real_human_labels)
 
-        fake_ai_logits = self.discriminator(fake_ai_inputs['input_ids'])
+        fake_ai_logits = self.discriminator(
+            fake_ai_inputs['input_ids'],
+            attention_mask=fake_ai_inputs['attention_mask'],
+            texts=fake_ai_texts
+        )
         loss_fake_ai = self.ce_loss(fake_ai_logits, real_ai_labels)
 
         d_loss = loss_real_human + loss_real_ai + loss_fake_human + loss_fake_ai
@@ -528,7 +790,14 @@ class ImprovedAdversarialTrainer:
         d_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), 1.0)
         self.d_optimizer.step()
-        self.d_scheduler.step()
+
+        # 🚀 判别器学习率预热
+        if self.current_step <= self.warmup_steps:
+            warmup_factor = self.current_step / self.warmup_steps
+            for param_group in self.d_optimizer.param_groups:
+                param_group['lr'] = self.config['d_learning_rate'] * warmup_factor
+        else:
+            self.d_scheduler.step()
 
         with torch.no_grad():
             real_human_acc = (real_human_logits.argmax(1) == real_human_labels).float().mean()
@@ -538,7 +807,10 @@ class ImprovedAdversarialTrainer:
 
     def train_generator(self, batch):
         self.generator.train()
-        self.g_optimizer.zero_grad()
+
+        # 🚀 梯度累积：只在累积周期开始时清零梯度
+        if self.accumulation_counter == 0:
+            self.g_optimizer.zero_grad()
 
         input_ids = batch['input_ids'].to(self.device)
         attention_mask = batch['attention_mask'].to(self.device)
@@ -547,62 +819,86 @@ class ImprovedAdversarialTrainer:
         original_lengths = batch['original_length'].to(self.device)
         texts = batch['text']
 
-        # ⭐ Teacher forcing
-        outputs = self.generator_model.forward_with_teacher_forcing(
-            input_ids, attention_mask, target_ids
-        )
-        reconstruction_loss = outputs.loss
+        # 🚀 使用混合精度训练
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            # ⭐ Teacher forcing
+            outputs = self.generator_model.forward_with_teacher_forcing(
+                input_ids, attention_mask, target_ids
+            )
+            reconstruction_loss = outputs.loss
 
-        # 生成文本
-        with torch.no_grad():
-            generated_ids_list = []
-            for i in range(len(texts)):
-                single_input = input_ids[i:i + 1]
-                single_mask = attention_mask[i:i + 1]
-                target_len = original_lengths[i].item()
+            # 🔧 优化：批量生成文本（使用平均长度作为目标）
+            with torch.no_grad():
+                avg_target_len = int(original_lengths.float().mean().item())
 
-                gen_ids = self.generator_model.generate_text(
-                    single_input, single_mask, target_length=target_len
+                # 批量生成
+                generated_ids = self.generator_model.generate_text(
+                    input_ids, attention_mask, target_length=avg_target_len
                 )
-                generated_ids_list.append(gen_ids[0])
 
-            max_gen_len = max(len(ids) for ids in generated_ids_list)
-            generated_ids = torch.zeros(
-                len(generated_ids_list), max_gen_len, dtype=torch.long
+            generated_texts = [
+                self.tokenizer.decode(ids, skip_special_tokens=True)
+                for ids in generated_ids
+            ]
+
+            # 损失计算
+            length_loss = self.compute_length_loss(generated_ids, original_lengths)
+            semantic_loss = self.compute_semantic_loss(list(texts), generated_texts)
+
+            gen_inputs = self.tokenizer(
+                generated_texts, padding=True, truncation=True,
+                max_length=384, return_tensors='pt'
             ).to(self.device)
 
-            for i, ids in enumerate(generated_ids_list):
-                generated_ids[i, :len(ids)] = ids
+            # 🚀 使用困惑度特征的判别器：传入生成的文本
+            fake_logits = self.discriminator(
+                gen_inputs['input_ids'],
+                attention_mask=gen_inputs['attention_mask'],
+                texts=generated_texts
+            )
+            adv_loss = self.ce_loss(fake_logits, target_style)
 
-        generated_texts = [
-            self.tokenizer.decode(ids, skip_special_tokens=True)
-            for ids in generated_ids
-        ]
+            # 总损失
+            g_loss = (
+                    self.config['lambda_reconstruction'] * reconstruction_loss +
+                    self.config['lambda_adv'] * adv_loss +
+                    self.config['lambda_length'] * length_loss +
+                    self.config['lambda_semantic'] * semantic_loss
+            )
 
-        # 损失计算
-        length_loss = self.compute_length_loss(generated_ids, original_lengths)
-        semantic_loss = self.compute_semantic_loss(list(texts), generated_texts)
+            # 🚀 梯度累积：缩放损失
+            scaled_loss = g_loss / self.gradient_accumulation_steps
 
-        gen_inputs = self.tokenizer(
-            generated_texts, padding=True, truncation=True,
-            max_length=384, return_tensors='pt'
-        ).to(self.device)
+        # 🚀 混合精度：使用scaler进行反向传播
+        if self.use_amp:
+            self.scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
 
-        fake_logits = self.discriminator(gen_inputs['input_ids'])
-        adv_loss = self.ce_loss(fake_logits, target_style)
+        # 🚀 梯度累积：只在累积周期结束时更新权重
+        self.accumulation_counter += 1
+        if self.accumulation_counter >= self.gradient_accumulation_steps:
+            if self.use_amp:
+                self.scaler.unscale_(self.g_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 1.0)
+                self.scaler.step(self.g_optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 1.0)
+                self.g_optimizer.step()
 
-        # 总损失
-        g_loss = (
-                self.config['lambda_reconstruction'] * reconstruction_loss +
-                self.config['lambda_adv'] * adv_loss +
-                self.config['lambda_length'] * length_loss +
-                self.config['lambda_semantic'] * semantic_loss
-        )
+            # 🚀 学习率预热逻辑
+            self.current_step += 1
+            if self.current_step <= self.warmup_steps:
+                # Warmup阶段：线性增加学习率
+                warmup_factor = self.current_step / self.warmup_steps
+                for param_group in self.g_optimizer.param_groups:
+                    param_group['lr'] = self.config['g_learning_rate'] * warmup_factor
+            else:
+                # Warmup后：使用cosine调度
+                self.g_scheduler.step()
 
-        g_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 1.0)
-        self.g_optimizer.step()
-        self.g_scheduler.step()
+            self.accumulation_counter = 0
 
         return {
             'g_loss': g_loss.item(),
@@ -647,15 +943,16 @@ class ImprovedAdversarialTrainer:
             # 生成假样本
             self.generator.eval()
             with torch.no_grad():
-                # ⭐ AI→Human: 生成更多样本（增加到12个，原来是8个）
+                # 🔧 修复：平衡样本数量，避免判别器偏向某一类
+                max_samples = self.config['max_samples_per_direction']
+
                 fake_human_texts = []
-                for text in ai_texts[:min(len(ai_texts), 12)]:
+                for text in ai_texts[:min(len(ai_texts), max_samples)]:
                     fake_human = self.generator_model.generate_with_style(text, 0, preserve_length=True)
                     fake_human_texts.append(fake_human)
 
-                # Human→AI: 保持原样本数量
                 fake_ai_texts = []
-                for text in human_texts[:min(len(human_texts), 8)]:
+                for text in human_texts[:min(len(human_texts), max_samples)]:
                     fake_ai = self.generator_model.generate_with_style(text, 1, preserve_length=True)
                     fake_ai_texts.append(fake_ai)
 
@@ -726,8 +1023,14 @@ class ImprovedAdversarialTrainer:
         save_dir = os.path.join(self.config['output_dir'], f'epoch_{epoch}_results')
         os.makedirs(save_dir, exist_ok=True)
 
+        # 🚀 限制评估样本数量以加快速度（可配置）
+        max_eval_samples = self.config.get('max_eval_samples', None)
+
         # ===== AI → Human =====
         ai_texts = self.dev_data.get('ai_texts', [])
+        if max_eval_samples is not None and len(ai_texts) > max_eval_samples:
+            logger.info(f"  ⚡ 限制AI→Human评估样本数: {len(ai_texts)} -> {max_eval_samples}")
+            ai_texts = ai_texts[:max_eval_samples]
         ai_originals = []
         ai_generated = []
         ai_results = []
@@ -770,6 +1073,9 @@ class ImprovedAdversarialTrainer:
 
         # ===== Human → AI =====
         human_texts = self.dev_data.get('human_texts', [])
+        if max_eval_samples is not None and len(human_texts) > max_eval_samples:
+            logger.info(f"  ⚡ 限制Human→AI评估样本数: {len(human_texts)} -> {max_eval_samples}")
+            human_texts = human_texts[:max_eval_samples]
         human_originals = []
         human_generated = []
         human_results = []
@@ -965,19 +1271,25 @@ class ImprovedAdversarialTrainer:
                 logger.info(f"{'=' * 80}\n")
 
             # ⭐ 判断是否为最佳模型
+            # 🚀 评估权重（可配置）
+            EVAL_WEIGHT_AI2H_SEMANTIC = self.config.get('eval_weight_ai2h_semantic', 0.3)
+            EVAL_WEIGHT_AI2H_BLEU = self.config.get('eval_weight_ai2h_bleu', 0.2)
+            EVAL_WEIGHT_AI2H_SUCCESS = self.config.get('eval_weight_ai2h_success', 0.4)
+            EVAL_WEIGHT_H2A_SUCCESS = self.config.get('eval_weight_h2a_success', 0.1)
+
             is_best = False
             current_score = (
-                    eval_metrics.get('ai_to_human_semantic_sim', 0) * 0.3 +
-                    eval_metrics.get('ai_to_human_bleu', 0) * 0.2 +
-                    eval_metrics.get('ai_to_human_success_rate', 0) * 0.4 +
-                    eval_metrics.get('human_to_ai_success_rate', 0) * 0.1
+                    eval_metrics.get('ai_to_human_semantic_sim', 0) * EVAL_WEIGHT_AI2H_SEMANTIC +
+                    eval_metrics.get('ai_to_human_bleu', 0) * EVAL_WEIGHT_AI2H_BLEU +
+                    eval_metrics.get('ai_to_human_success_rate', 0) * EVAL_WEIGHT_AI2H_SUCCESS +
+                    eval_metrics.get('human_to_ai_success_rate', 0) * EVAL_WEIGHT_H2A_SUCCESS
             )
 
             best_score = (
-                    self.best_metrics.get('ai_to_human_semantic_sim', 0) * 0.3 +
-                    self.best_metrics.get('ai_to_human_bleu', 0) * 0.2 +
-                    self.best_metrics.get('ai_to_human_success_rate', 0) * 0.4 +
-                    self.best_metrics.get('human_to_ai_success_rate', 0) * 0.1
+                    self.best_metrics.get('ai_to_human_semantic_sim', 0) * EVAL_WEIGHT_AI2H_SEMANTIC +
+                    self.best_metrics.get('ai_to_human_bleu', 0) * EVAL_WEIGHT_AI2H_BLEU +
+                    self.best_metrics.get('ai_to_human_success_rate', 0) * EVAL_WEIGHT_AI2H_SUCCESS +
+                    self.best_metrics.get('human_to_ai_success_rate', 0) * EVAL_WEIGHT_H2A_SUCCESS
             )
 
             if current_score > best_score:
@@ -1026,10 +1338,11 @@ class ImprovedAdversarialTrainer:
 
 # ===================== 多卡训练主函数 =====================
 
-def train_worker(rank, world_size, config, datasets):
+def train_worker(rank, world_size, config, datasets, master_port):
     """每个GPU进程的训练函数"""
-    # 设置分布式环境
-    setup_distributed(rank, world_size)
+    # 🔧 只在多卡时设置分布式环境
+    if world_size > 1:
+        setup_distributed(rank, world_size, master_port)
 
     # 设置随机种子
     torch.manual_seed(config['seed'] + rank)
@@ -1042,9 +1355,31 @@ def train_worker(rank, world_size, config, datasets):
         device=rank
     )
 
+    # 🚀 创建困惑度计算器（只在主进程打印日志）
+    perplexity_model_name = config.get('perplexity_model', 'gpt2')
+    if rank == 0:
+        logger.info(f"🔧 初始化困惑度计算器: {perplexity_model_name}")
+
+    perplexity_calculator = PerplexityCalculator(
+        model_name=perplexity_model_name,
+        device=rank,
+        max_length=config['max_length']
+    )
+
+    # 🔧 修复：从 tokenizer 获取词汇表大小
+    vocab_size = len(generator.tokenizer)
+
+    # 🚀 创建基于困惑度的判别器
+    use_perplexity = config.get('use_perplexity_discriminator', True)
+    if rank == 0:
+        logger.info(f"🔧 判别器使用困惑度特征: {use_perplexity}")
+
     discriminator = StyleDiscriminator(
-        hidden_dim=512,
-        style_dim=256
+        vocab_size=vocab_size,
+        perplexity_calculator=perplexity_calculator,
+        hidden_dim=256,
+        style_dim=128,
+        use_perplexity=use_perplexity
     )
 
     # 创建数据集
@@ -1077,11 +1412,18 @@ def train_worker(rank, world_size, config, datasets):
         shuffle=False
     )
 
+    # 🔧 修复：根据GPU数量动态调整num_workers，避免资源竞争
+    import multiprocessing
+    cpu_count = multiprocessing.cpu_count()
+    # 总workers限制在8以内，然后均分给各GPU
+    total_workers = min(cpu_count, 8)
+    num_workers_per_gpu = max(2, total_workers // world_size)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
         sampler=train_sampler,
-        num_workers=4,
+        num_workers=num_workers_per_gpu,
         pin_memory=True
     )
 
@@ -1089,7 +1431,7 @@ def train_worker(rank, world_size, config, datasets):
         dev_dataset,
         batch_size=config['batch_size'],
         sampler=dev_sampler,
-        num_workers=4,
+        num_workers=num_workers_per_gpu,
         pin_memory=True
     )
 
@@ -1108,8 +1450,9 @@ def train_worker(rank, world_size, config, datasets):
     # 开始训练
     trainer.train()
 
-    # 清理
-    cleanup_distributed()
+    # 🔧 只在多卡时清理分布式环境
+    if world_size > 1:
+        cleanup_distributed()
 
 
 def parse_args():
@@ -1141,6 +1484,28 @@ def parse_args():
                         help='Weight for length loss (default: 2.0)')
     parser.add_argument('--lambda_adv', type=float, default=2.0,
                         help='Weight for adversarial loss (default: 2.0)')
+
+    # 🚀 性能优化参数
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                        help='Gradient accumulation steps (default: 1)')
+    parser.add_argument('--use_amp', action='store_true',
+                        help='Use automatic mixed precision training')
+    parser.add_argument('--warmup_steps', type=int, default=500,
+                        help='Learning rate warmup steps (default: 500)')
+
+    # 🚀 生成参数
+    parser.add_argument('--max_samples_per_direction', type=int, default=10,
+                        help='Max samples per style transfer direction (default: 10)')
+
+    # 🚀 困惑度判别器参数
+    parser.add_argument('--perplexity_model', type=str, default='gpt2',
+                        help='Perplexity calculator model (default: gpt2)')
+    parser.add_argument('--no_perplexity', action='store_true',
+                        help='Disable perplexity features in discriminator')
+
+    # 🚀 评估参数
+    parser.add_argument('--max_eval_samples', type=int, default=None,
+                        help='Maximum number of samples to evaluate per direction (default: None, use all)')
 
     return parser.parse_args()
 
@@ -1174,6 +1539,21 @@ def main():
         'd_train_interval': 3,
         'eval_interval': 1,
 
+        # 🚀 性能优化
+        'gradient_accumulation_steps': args.gradient_accumulation_steps,
+        'use_amp': args.use_amp,
+        'warmup_steps': args.warmup_steps,
+
+        # 🚀 生成配置
+        'max_samples_per_direction': args.max_samples_per_direction,
+
+        # 🚀 困惑度判别器配置
+        'perplexity_model': args.perplexity_model,
+        'use_perplexity_discriminator': not args.no_perplexity,
+
+        # 🚀 评估配置
+        'max_eval_samples': args.max_eval_samples,
+
         # WandB配置
         'use_wandb': not args.no_wandb,
         'wandb_project': args.wandb_project,
@@ -1202,19 +1582,24 @@ def main():
     logger.info(f"损失权重: Recon={config['lambda_reconstruction']}, Adv={config['lambda_adv']}, "
                 f"Semantic={config['lambda_semantic']}, Length={config['lambda_length']}")
     logger.info(f"评估权重: AI→Human成功率=40%, 语义=30%, BLEU=20%, Human→AI=10%")
+    logger.info(f"🚀 困惑度判别器: {'启用' if config['use_perplexity_discriminator'] else '禁用'} "
+                f"(模型: {config['perplexity_model']})")
     logger.info(f"{'=' * 80}\n")
 
     if world_size > 1:
-        logger.info("🚀 启动多卡训练...")
+        # 🔧 查找可用端口，避免端口冲突
+        master_port = find_free_port()
+        logger.info(f"🚀 启动多卡训练 (使用端口: {master_port})...")
         mp.spawn(
             train_worker,
-            args=(world_size, config, datasets),
+            args=(world_size, config, datasets, master_port),
             nprocs=world_size,
             join=True
         )
     else:
         logger.info("🚀 启动单卡训练...")
-        train_worker(0, 1, config, datasets)
+        # 单卡不需要分布式，使用None作为master_port
+        train_worker(0, 1, config, datasets, None)
 
 
 if __name__ == "__main__":
